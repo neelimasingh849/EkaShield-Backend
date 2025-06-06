@@ -1,0 +1,174 @@
+import os
+import json
+import re
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from together import Together
+from mangum import Mangum
+
+app = FastAPI()
+handler = Mangum(app)
+
+together = Together(api_key=os.environ.get("TOGETHER_AI_KEY"))
+
+MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.1"
+
+
+def extract_json(text):
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        return match.group(0)
+    return None
+
+@app.get("/")
+def startup():
+    return "EkaShield is up and running."
+
+@app.post("/insurance-info")
+async def extract_insurance_data(request: Request):
+    try:
+        body = await request.json()
+
+        if "data" not in body:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Request JSON must contain a top-level 'data' key."}
+            )
+
+        data = body["data"]
+        data_text = json.dumps(data, indent=2, ensure_ascii=False)
+
+        prompt = f"""
+You are an insurance eligibility expert.
+
+Below is the patient and treatment input data. Use it to extract and assess claim eligibility under ACKO Retail Health Policy.
+
+📦 Embedded input:
+{data_text}
+
+---
+
+📄 Policy Decision Rules (ACKO Retail Health Policy):
+- ✅ Accept claim only if:
+  • Hospitalization is >24 hours OR procedure is classified as valid day-care
+  • Diagnosis is covered
+  • Billing receipt is submitted
+  • Policy start date shows coverage >3 years ago if pre-existing conditions exist
+
+- ❌ Reject claim if any of the following:
+  • No receipt submitted
+  • Hospitalization hours missing or <24 (non-day-care)
+  • Policy start date missing or too recent for pre-existing condition
+  • Treatment not medically necessary or not in India
+
+⚠️ If any rejection rule is matched, REJECT the claim — no exceptions.
+
+---
+
+📥 Step 1 — Extract ONLY this structure (fill in what you can):
+{{
+  "patient_name": "",
+  "gender": "",
+  "age": "",
+  "doctor": "",
+  "clinic": "",
+  "phone": "",
+  "abha_address": "",
+  "visit_date": "",
+  "followup_date": "",
+  "diagnosed_conditions": [],
+  "procedures": [],
+  "hospitalization_hours": null,
+  "treatment_location": "India",
+  "policy": {{
+    "start_date": "",
+    "pre_existing_conditions": {{}}
+  }},
+  "billing_info": {{
+    "total_amount": null,
+    "receipt_submitted": false
+  }}
+}}
+
+📤 Step 2 — Respond ONLY in this exact JSON format:
+{{
+  "extracted_info": {{
+    "patient_name": "",
+    "gender": "",
+    "age": "",
+    "doctor": "",
+    "clinic": "",
+    "phone": "",
+    "abha_address": "",
+    "visit_date": "",
+    "followup_date": "",
+    "diagnosed_conditions": [],
+    "procedures": [],
+    "hospitalization_hours": null,
+    "treatment_location": "India",
+    "policy": {{
+      "start_date": "",
+      "pre_existing_conditions": {{}}
+    }},
+    "billing_info": {{
+      "total_amount": null,
+      "receipt_submitted": false
+    }}
+  }},
+  "reasons_for_acceptance": [
+    // REQUIRED if claim_assessment is "Likely to be accepted" — Must explain why the policy is satisfied.
+  ],
+  "reasons_for_rejection": [
+    // REQUIRED if claim_assessment is "Likely to be rejected" — Must clearly state violated rules.
+  ],
+  "claim_assessment": "Likely to be accepted" or "Likely to be rejected"
+}}
+
+⚠️ DO NOT omit reasons or leave them empty.
+⚠️ DO NOT return markdown or extra explanation — only valid JSON.
+"""
+
+        response = together.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        ai_output = response.choices[0].message.content
+        print("🔎 RAW LLM output:\n", repr(ai_output))
+
+        json_str = extract_json(ai_output)
+        if not json_str:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Could not extract valid JSON from LLM output."}
+            )
+
+        result = json.loads(json_str)
+
+        info = result.get("extracted_info", {})
+        billing = info.get("billing_info", {})
+        hospitalization = info.get("hospitalization_hours")
+
+        force_reject_reasons = []
+        if billing.get("receipt_submitted") is not True:
+            force_reject_reasons.append("Missing billing receipt")
+        if hospitalization is None or (isinstance(hospitalization, (int, float)) and hospitalization < 24):
+            force_reject_reasons.append("Hospitalization hours missing or less than 24")
+
+        if force_reject_reasons:
+            result["claim_assessment"] = "Likely to be Likely to be rejected"
+            result["reasons_for_acceptance"] = []
+            result["reasons_for_rejection"] = force_reject_reasons
+
+        return JSONResponse(content=result)
+
+    except json.JSONDecodeError as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"JSON parse error: {str(e)}"}
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
